@@ -4,11 +4,10 @@
  * Equivalente TypeScript do backend/sheets_direct.py
  */
 
-const SHEETS_URL =
-  process.env.SHEETS_URL ||
-  'https://docs.google.com/spreadsheets/d/e/' +
-    '2PACX-1vTA-NhmgA6J9Tnhu_3yHfiOTVjuQ5f3O-31DKnBxYV_68Jpu5kbZcx4skQpvfyxZdAsRYf0zR-Wxql8' +
-    '/pub?gid=255383776&single=true&output=csv'
+// URL do Google Apps Script (retorna JSON diretamente da planilha)
+const APPS_SCRIPT_URL =
+  process.env.APPS_SCRIPT_URL ||
+  'https://script.google.com/macros/s/AKfycbydiLFWnfExm9mtZNYXb3uE98LCjn8-wIpat9vidLZKLhpbkKxDdYSLZg73rq1B_KBU/exec'
 
 const CACHE_TTL = 3600 * 1000 // 1 hora em ms
 const HH_MES = 730.0
@@ -97,76 +96,24 @@ function normalizeRow(rawFields: string[], header: string[]): Row {
   return out
 }
 
-// ── CSV parser manual (sem dependência externa, linha por linha) ──────────────
+// ── Fetch via Google Apps Script (JSON) ──────────────────────────────────────
 
-/** Parse CSV respeitando campos entre aspas com vírgulas internas */
-function parseCSVLine(line: string): string[] {
-  const fields: string[] = []
-  let cur = ''
-  let inQuote = false
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
-    if (ch === '"') {
-      if (inQuote && line[i + 1] === '"') {
-        cur += '"'
-        i++
-      } else {
-        inQuote = !inQuote
-      }
-    } else if (ch === ',' && !inQuote) {
-      fields.push(cur)
-      cur = ''
-    } else {
-      cur += ch
+function normalizeRowFromJSON(rawObj: Record<string, string>): Row {
+  const out: Row = {}
+  const entries = Object.entries(rawObj)
+  for (const [key, val] of entries) {
+    const nk = normKey(key)
+    const canonical = COL_MAP[nk] ?? nk
+    out[canonical] = String(val ?? '').trim()
+  }
+  // Força TIPO_OCORRENCIA pela chave original "DEFEITO/FALHA?" caso existir
+  for (const [key, val] of entries) {
+    if (key.trim().toUpperCase().includes('DEFEITO') && key.includes('?')) {
+      out['TIPO_OCORRENCIA'] = String(val ?? '').trim()
+      break
     }
   }
-  fields.push(cur)
-  return fields
-}
-
-// ── Fetch + cache ─────────────────────────────────────────────────────────────
-
-async function fetchCSVText(): Promise<string> {
-  const urls = [
-    // Tentativa 1: URL direta
-    { url: SHEETS_URL, opts: {
-      cache: 'no-store' as const,
-      redirect: 'follow' as const,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/csv,text/plain,*/*',
-      },
-      signal: AbortSignal.timeout(30_000),
-    }},
-    // Tentativa 2: Proxy allorigins.win
-    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(SHEETS_URL)}`, opts: {
-      cache: 'no-store' as const,
-      signal: AbortSignal.timeout(30_000),
-    }},
-    // Tentativa 3: Proxy corsproxy.io
-    { url: `https://corsproxy.io/?${encodeURIComponent(SHEETS_URL)}`, opts: {
-      cache: 'no-store' as const,
-      signal: AbortSignal.timeout(30_000),
-    }},
-  ]
-
-  for (const { url, opts } of urls) {
-    try {
-      const resp = await fetch(url, opts)
-      if (resp.ok) {
-        const text = await resp.text()
-        // Valida que é um CSV real (tem vírgulas e linhas)
-        if (text.includes(',') && text.includes('\n')) {
-          console.log(`[sheets] Fetch OK via: ${url.substring(0, 60)}...`)
-          return text
-        }
-      }
-    } catch (err) {
-      console.warn(`[sheets] Tentativa falhou (${url.substring(0, 60)}):`, err)
-    }
-  }
-
-  throw new Error('Todos os métodos de acesso ao Google Sheets falharam')
+  return out
 }
 
 export async function fetchRaw(): Promise<Row[]> {
@@ -175,23 +122,23 @@ export async function fetchRaw(): Promise<Row[]> {
     return _cache.data
   }
 
-  const text = await fetchCSVText()
-  const lines = text.split(/\r?\n/)
+  const resp = await fetch(APPS_SCRIPT_URL, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(120_000),
+  })
 
-  if (lines.length < 2) {
-    _cache.data = []
-    _cache.ts = now
-    return []
+  if (!resp.ok) throw new Error(`Apps Script fetch failed: ${resp.status}`)
+
+  const json = await resp.json() as { ok: boolean; rows?: Record<string, string>[]; error?: string }
+
+  if (!json.ok || !Array.isArray(json.rows)) {
+    throw new Error(`Apps Script error: ${json.error ?? 'resposta inválida'}`)
   }
 
-  const header = parseCSVLine(lines[0])
   const rows: Row[] = []
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim()
-    if (!line) continue
-    const fields = parseCSVLine(line)
-    const row = normalizeRow(fields, header)
+  for (const rawObj of json.rows) {
+    const row = normalizeRowFromJSON(rawObj)
     // Ignora linhas sem ID_CHAMADO
     if (!clean(row['ID_CHAMADO'])) continue
     // Filtra apenas ABERTURA

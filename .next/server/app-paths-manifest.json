@@ -1,4 +1,7 @@
 {
   "/page": "app/page.js",
-  "/mttr-mtbf/page": "app/mttr-mtbf/page.js"
+  "/disponibilidade/page": "app/disponibilidade/page.js",
+  "/mttr-mtbf/page": "app/mttr-mtbf/page.js",
+  "/chamados/page": "app/chamados/page.js",
+  "/ocorrencias/page": "app/ocorrencias/page.js"
 }

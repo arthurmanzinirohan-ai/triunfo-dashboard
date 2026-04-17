@@ -1,0 +1,6 @@
+{
+  "/mttr-mtbf/page": "app/mttr-mtbf/page.js",
+  "/api/admin/sync/route": "app/api/admin/sync/route.js",
+  "/api/filtros/opcoes/route": "app/api/filtros/opcoes/route.js",
+  "/page": "app/page.js"
+}

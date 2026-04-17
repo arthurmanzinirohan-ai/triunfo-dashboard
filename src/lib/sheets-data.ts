@@ -126,28 +126,56 @@ function parseCSVLine(line: string): string[] {
 
 // ── Fetch + cache ─────────────────────────────────────────────────────────────
 
+async function fetchCSVText(): Promise<string> {
+  const urls = [
+    // Tentativa 1: URL direta
+    { url: SHEETS_URL, opts: {
+      cache: 'no-store' as const,
+      redirect: 'follow' as const,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/csv,text/plain,*/*',
+      },
+      signal: AbortSignal.timeout(30_000),
+    }},
+    // Tentativa 2: Proxy allorigins.win
+    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(SHEETS_URL)}`, opts: {
+      cache: 'no-store' as const,
+      signal: AbortSignal.timeout(30_000),
+    }},
+    // Tentativa 3: Proxy corsproxy.io
+    { url: `https://corsproxy.io/?${encodeURIComponent(SHEETS_URL)}`, opts: {
+      cache: 'no-store' as const,
+      signal: AbortSignal.timeout(30_000),
+    }},
+  ]
+
+  for (const { url, opts } of urls) {
+    try {
+      const resp = await fetch(url, opts)
+      if (resp.ok) {
+        const text = await resp.text()
+        // Valida que é um CSV real (tem vírgulas e linhas)
+        if (text.includes(',') && text.includes('\n')) {
+          console.log(`[sheets] Fetch OK via: ${url.substring(0, 60)}...`)
+          return text
+        }
+      }
+    } catch (err) {
+      console.warn(`[sheets] Tentativa falhou (${url.substring(0, 60)}):`, err)
+    }
+  }
+
+  throw new Error('Todos os métodos de acesso ao Google Sheets falharam')
+}
+
 export async function fetchRaw(): Promise<Row[]> {
   const now = Date.now()
   if (_cache.data !== null && now - _cache.ts < CACHE_TTL) {
     return _cache.data
   }
 
-  const resp = await fetch(SHEETS_URL, {
-    cache: 'no-store',
-    redirect: 'follow',
-    headers: {
-      'Accept': 'text/csv',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept-Language': 'pt-BR,pt;q=0.9',
-      'Referer': 'https://docs.google.com/',
-      'Cookie': '',
-    },
-    // Next.js fetch timeout via signal - 120 segundos
-    signal: AbortSignal.timeout(120_000),
-  })
-  if (!resp.ok) throw new Error(`Sheets fetch failed: ${resp.status}`)
-
-  const text = await resp.text()
+  const text = await fetchCSVText()
   const lines = text.split(/\r?\n/)
 
   if (lines.length < 2) {

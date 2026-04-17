@@ -4,10 +4,10 @@
  * Equivalente TypeScript do backend/sheets_direct.py
  */
 
-// URL do Google Apps Script (retorna JSON diretamente da planilha)
-const APPS_SCRIPT_URL =
-  process.env.APPS_SCRIPT_URL ||
-  'https://script.google.com/macros/s/AKfycbydiLFWnfExm9mtZNYXb3uE98LCjn8-wIpat9vidLZKLhpbkKxDdYSLZg73rq1B_KBU/exec'
+// Endpoint gviz do Google Sheets — rápido, sem redirecionamento, sem autenticação
+const SPREADSHEET_ID = '1oUYRanqMyd9YFOTzCHJJ4PIrUucd_9z1rMKBXYfW4OY'
+const SHEET_GID      = '255383776'
+const GVIZ_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&gid=${SHEET_GID}`
 
 const CACHE_TTL = 3600 * 1000 // 1 hora em ms
 const HH_MES = 730.0
@@ -96,25 +96,7 @@ function normalizeRow(rawFields: string[], header: string[]): Row {
   return out
 }
 
-// ── Fetch via Google Apps Script (JSON) ──────────────────────────────────────
-
-function normalizeRowFromJSON(rawObj: Record<string, string>): Row {
-  const out: Row = {}
-  const entries = Object.entries(rawObj)
-  for (const [key, val] of entries) {
-    const nk = normKey(key)
-    const canonical = COL_MAP[nk] ?? nk
-    out[canonical] = String(val ?? '').trim()
-  }
-  // Força TIPO_OCORRENCIA pela chave original "DEFEITO/FALHA?" caso existir
-  for (const [key, val] of entries) {
-    if (key.trim().toUpperCase().includes('DEFEITO') && key.includes('?')) {
-      out['TIPO_OCORRENCIA'] = String(val ?? '').trim()
-      break
-    }
-  }
-  return out
-}
+// ── Fetch via endpoint gviz do Google Sheets ─────────────────────────────────
 
 export async function fetchRaw(): Promise<Row[]> {
   const now = Date.now()
@@ -122,28 +104,51 @@ export async function fetchRaw(): Promise<Row[]> {
     return _cache.data
   }
 
-  const resp = await fetch(APPS_SCRIPT_URL, {
+  const resp = await fetch(GVIZ_URL, {
     cache: 'no-store',
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(30_000),
   })
 
-  if (!resp.ok) throw new Error(`Apps Script fetch failed: ${resp.status}`)
+  if (!resp.ok) throw new Error(`gviz fetch failed: ${resp.status}`)
 
-  const json = await resp.json() as { ok: boolean; rows?: Record<string, string>[]; error?: string }
-
-  if (!json.ok || !Array.isArray(json.rows)) {
-    throw new Error(`Apps Script error: ${json.error ?? 'resposta inválida'}`)
+  // Remove wrapper JS: /*O_o*/\ngoogle.visualization.Query.setResponse({...});
+  const raw = await resp.text()
+  const jsonStr = raw.replace(/^[^{]*/, '').replace(/\);?\s*$/, '')
+  const gviz = JSON.parse(jsonStr) as {
+    table: {
+      cols: { label: string; type: string }[]
+      rows: { c: ({ v: unknown; f?: string } | null)[] }[]
+    }
   }
 
+  const cols = gviz.table.cols
+  const headers = cols.map(c => c.label ?? '')
   const rows: Row[] = []
 
-  for (const rawObj of json.rows) {
-    const row = normalizeRowFromJSON(rawObj)
-    // Ignora linhas sem ID_CHAMADO
-    if (!clean(row['ID_CHAMADO'])) continue
-    // Filtra apenas ABERTURA
-    if (clean(row['TIPO_CHAMADO']) !== 'ABERTURA') continue
-    rows.push(row)
+  for (const gRow of gviz.table.rows) {
+    if (!gRow || !gRow.c) continue
+    const fields: string[] = gRow.c.map((cell, i) => {
+      if (!cell || cell.v === null || cell.v === undefined) return ''
+      // Formatos especiais do gviz
+      if (cols[i]?.type === 'date' || cols[i]?.type === 'datetime') {
+        return cell.f ?? String(cell.v)
+      }
+      return String(cell.v)
+    })
+
+    // Constrói row com normalização
+    const out: Row = {}
+    for (let i = 0; i < headers.length; i++) {
+      const nk = normKey(headers[i])
+      const canonical = COL_MAP[nk] ?? nk
+      out[canonical] = fields[i] ?? ''
+    }
+    // Força TIPO_OCORRENCIA da coluna T (índice 19)
+    if (fields.length > 19) out['TIPO_OCORRENCIA'] = fields[19].trim()
+
+    if (!clean(out['ID_CHAMADO'])) continue
+    if (clean(out['TIPO_CHAMADO']) !== 'ABERTURA') continue
+    rows.push(out)
   }
 
   _cache.data = rows

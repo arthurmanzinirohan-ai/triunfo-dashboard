@@ -134,14 +134,16 @@ export async function fetchRaw(): Promise<Row[]> {
 
   const resp = await fetch(SHEETS_URL, {
     cache: 'no-store',
+    redirect: 'follow',
     headers: {
       'Accept': 'text/csv',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
       'Accept-Language': 'pt-BR,pt;q=0.9',
       'Referer': 'https://docs.google.com/',
+      'Cookie': '',
     },
-    // Next.js fetch timeout via signal
-    signal: AbortSignal.timeout(60_000),
+    // Next.js fetch timeout via signal - 120 segundos
+    signal: AbortSignal.timeout(120_000),
   })
   if (!resp.ok) throw new Error(`Sheets fetch failed: ${resp.status}`)
 

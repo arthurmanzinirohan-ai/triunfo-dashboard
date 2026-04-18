@@ -1,56 +1,43 @@
 /**
  * sheets-data.ts
- * Fetch + parse Google Sheets CSV, cache em memória, cálculos de KPI.
- * Equivalente TypeScript do backend/sheets_direct.py
+ * Busca dados do Google Sheets via CSV público, calcula KPIs.
  */
 
-// Endpoint gviz do Google Sheets — rápido, sem redirecionamento, sem autenticação
-const SPREADSHEET_ID = '1oUYRanqMyd9YFOTzCHJJ4PIrUucd_9z1rMKBXYfW4OY'
-const SHEET_GID      = '255383776'
-const GVIZ_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&gid=${SHEET_GID}`
+const CSV_URL =
+  process.env.SHEETS_URL ??
+  'https://docs.google.com/spreadsheets/d/e/2PACX-1vTA-NhmgA6J9Tnhu_3yHfiOTVjuQ5f3O-31DKnBxYV_68Jpu5kbZcx4skQpvfyxZdAsRYf0zR-Wxql8/pub?gid=255383776&single=true&output=csv'
 
-const CACHE_TTL = 3600 * 1000 // 1 hora em ms
+const CACHE_TTL = 3600 * 1000 // 1 hora
 const HH_MES = 730.0
 
-// ── Cache singleton ───────────────────────────────────────────────────────────
+// ── Cache singleton ──────────────────────────────────────────────────────────
 
-interface CacheEntry {
-  data: Row[] | null
-  ts: number
-}
-
-// globalThis garante singleton mesmo com hot-reload do Next.js dev
+interface CacheEntry { data: Row[] | null; ts: number }
 const _g = globalThis as typeof globalThis & { __sheetsCache?: CacheEntry }
-if (!_g.__sheetsCache) {
-  _g.__sheetsCache = { data: null, ts: 0 }
-}
+if (!_g.__sheetsCache) _g.__sheetsCache = { data: null, ts: 0 }
 const _cache = _g.__sheetsCache
 
-// ── Tipos ─────────────────────────────────────────────────────────────────────
+// ── Tipos ────────────────────────────────────────────────────────────────────
 
 export type Row = Record<string, string>
 
-// ── Normalização de colunas ───────────────────────────────────────────────────
+// ── Normalização de colunas ──────────────────────────────────────────────────
 
-/** Remove acentos, collapsa espaços, uppercase — igual ao _norm_key Python */
 function normKey(k: string): string {
-  return k
-    .trim()
-    .replace(/\s+/g, ' ')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toUpperCase()
-    .trim()
+  return k.trim().replace(/\s+/g, ' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim()
 }
 
 const COL_MAP: Record<string, string> = {
   'ID NO DO CHAMADO':           'ID_CHAMADO',
   'ID N DO CHAMADO':            'ID_CHAMADO',
+  'NO DO CHAMADO':              'ID_CHAMADO',
+  'N DO CHAMADO':               'ID_CHAMADO',
   'CHAMADO':                    'TIPO_CHAMADO',
   'DATA INICIAL':               'DATA_INICIAL',
   'ANO':                        'ANO',
   'MES':                        'MES',
   'MES ABREV.':                 'MES_ABREV',
+  'MES ABREV':                  'MES_ABREV',
   'MES/ANO':                    'MES_ANO',
   'EQPTO':                      'EQPTO',
   'SIGLA':                      'SIGLA',
@@ -58,6 +45,7 @@ const COL_MAP: Record<string, string> = {
   'CONTRATO':                   'CONTRATO',
   'LOCALIZACAO':                'LOCALIZACAO',
   'DEFEITO/FALHA?':             'TIPO_OCORRENCIA',
+  'DEFEITO/FALHA':              'TIPO_OCORRENCIA',
   'DESCRICAO DO CHAMADO':       'DESCRICAO',
   'ATENDENTES':                 'ATENDENTES',
   'CAUSA':                      'CAUSA',
@@ -65,14 +53,19 @@ const COL_MAP: Record<string, string> = {
   'SERVICO REALIZADO':          'SERVICO',
   'STATUS DO CHAMADO':          'STATUS_CHAMADO',
   'EQUIPAMENTO PARADO?':        'EQ_PARADO',
+  'EQUIPAMENTO PARADO':         'EQ_PARADO',
   'TEMPO INDISP.':              'TEMPO_INDISP',
+  'TEMPO INDISP':               'TEMPO_INDISP',
   'HH - SALDO DISPONIVEL MES':  'HH_DISPONIVEL',
   'HH -  SALDO DISPONIVEL MES': 'HH_DISPONIVEL',
   'HH - SALDO DISPONAVEL MES':  'HH_DISPONIVEL',
   'HH -  SALDO DISPONAVEL MES': 'HH_DISPONIVEL',
+  'HH SALDO DISPONIVEL MES':    'HH_DISPONIVEL',
+  'HH SALDO DISPONAVEL MES':    'HH_DISPONIVEL',
   'FAMILIA':                    'FAMILIA',
   'DEFEITO':                    'DEFEITO',
   'F_DEFEITO/FALHA':            'F_TIPO_OCORRENCIA',
+  'F_DEFEITO/FALHA?':           'F_TIPO_OCORRENCIA',
   'F_STATUS DO CHAMADO':        'F_STATUS_CHAMADO',
   'F_SISTEMA':                  'F_SISTEMA',
   'F_SISTEMA_5':                'F_SISTEMA',
@@ -82,21 +75,36 @@ const COL_MAP: Record<string, string> = {
   'TIPO DE MOVIMENTO':          'TIPO_MOVIMENTO',
 }
 
-function normalizeRow(rawFields: string[], header: string[]): Row {
-  const out: Row = {}
-  for (let i = 0; i < header.length; i++) {
-    const nk = normKey(header[i])
-    const canonical = COL_MAP[nk] ?? nk
-    out[canonical] = rawFields[i] ?? ''
+// ── Parser CSV ───────────────────────────────────────────────────────────────
+
+function parseLine(line: string): string[] {
+  const result: string[] = []
+  let field = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (inQuotes) {
+      if (c === '"' && line[i + 1] === '"') { field += '"'; i++ }
+      else if (c === '"') inQuotes = false
+      else field += c
+    } else {
+      if (c === '"') inQuotes = true
+      else if (c === ',') { result.push(field.trim()); field = '' }
+      else field += c
+    }
   }
-  // Força coluna T (índice 19) para TIPO_OCORRENCIA — leitura por posição
-  if (rawFields.length > 19) {
-    out['TIPO_OCORRENCIA'] = (rawFields[19] ?? '').trim()
-  }
-  return out
+  result.push(field.trim())
+  return result
 }
 
-// ── Fetch via endpoint gviz do Google Sheets ─────────────────────────────────
+function parseCSV(text: string): { headers: string[]; rows: string[][] } {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
+  const headers = parseLine(lines[0])
+  const rows = lines.slice(1).filter(l => l.trim() !== '').map(parseLine)
+  return { headers, rows }
+}
+
+// ── Fetch CSV ────────────────────────────────────────────────────────────────
 
 export async function fetchRaw(): Promise<Row[]> {
   const now = Date.now()
@@ -104,56 +112,30 @@ export async function fetchRaw(): Promise<Row[]> {
     return _cache.data
   }
 
-  const resp = await fetch(GVIZ_URL, {
-    cache: 'no-store',
-    signal: AbortSignal.timeout(30_000),
+  const resp = await fetch(CSV_URL, { cache: 'no-store', signal: AbortSignal.timeout(30_000) })
+  if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status}`)
+
+  const text = await resp.text()
+  const { headers, rows: csvRows } = parseCSV(text)
+
+  const canonicalHeaders = headers.map(h => {
+    const nk = normKey(h)
+    return COL_MAP[nk] ?? nk
   })
 
-  if (!resp.ok) throw new Error(`gviz fetch failed: ${resp.status}`)
-
-  // Remove wrapper JS: /*O_o*/\ngoogle.visualization.Query.setResponse({...});
-  const raw = await resp.text()
-  const jsonStr = raw.replace(/^[^{]*/, '').replace(/\);?\s*$/, '')
-  const gviz = JSON.parse(jsonStr) as {
-    table: {
-      cols: { label: string; type: string }[]
-      rows: { c: ({ v: unknown; f?: string } | null)[] }[]
+  const result: Row[] = []
+  for (const fields of csvRows) {
+    const row: Row = {}
+    for (let i = 0; i < canonicalHeaders.length; i++) {
+      row[canonicalHeaders[i]] = fields[i] ?? ''
     }
+    if (!clean(row['ID_CHAMADO'])) continue
+    result.push(row)
   }
 
-  const cols = gviz.table.cols
-  const headers = cols.map(c => c.label ?? '')
-  const rows: Row[] = []
-
-  for (const gRow of gviz.table.rows) {
-    if (!gRow || !gRow.c) continue
-    const fields: string[] = gRow.c.map((cell, i) => {
-      if (!cell || cell.v === null || cell.v === undefined) return ''
-      // Formatos especiais do gviz
-      if (cols[i]?.type === 'date' || cols[i]?.type === 'datetime') {
-        return cell.f ?? String(cell.v)
-      }
-      return String(cell.v)
-    })
-
-    // Constrói row com normalização
-    const out: Row = {}
-    for (let i = 0; i < headers.length; i++) {
-      const nk = normKey(headers[i])
-      const canonical = COL_MAP[nk] ?? nk
-      out[canonical] = fields[i] ?? ''
-    }
-    // Força TIPO_OCORRENCIA da coluna T (índice 19)
-    if (fields.length > 19) out['TIPO_OCORRENCIA'] = fields[19].trim()
-
-    if (!clean(out['ID_CHAMADO'])) continue
-    if (clean(out['TIPO_CHAMADO']) !== 'ABERTURA') continue
-    rows.push(out)
-  }
-
-  _cache.data = rows
+  _cache.data = result
   _cache.ts = now
-  return rows
+  return result
 }
 
 export function invalidateCache(): void {
@@ -161,7 +143,7 @@ export function invalidateCache(): void {
   _cache.ts = 0
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function clean(val: string | undefined | null): string | null {
   if (val == null) return null
@@ -172,17 +154,13 @@ export function clean(val: string | undefined | null): string | null {
 export function num(val: string | undefined | null, maxValue?: number): number | null {
   const v = clean(val)
   if (!v) return null
-  try {
-    const n = parseFloat(v.replace(',', '.').replace(/\s/g, ''))
-    if (isNaN(n)) return null
-    if (maxValue !== undefined && n > maxValue) return null
-    return n
-  } catch {
-    return null
-  }
+  const n = parseFloat(v.replace(',', '.').replace(/\s/g, ''))
+  if (isNaN(n)) return null
+  if (maxValue !== undefined && n > maxValue) return null
+  return n
 }
 
-// ── KPI Resumo ────────────────────────────────────────────────────────────────
+// ── KPI Resumo ───────────────────────────────────────────────────────────────
 
 export interface KPIResumo {
   total_chamados: number
@@ -198,13 +176,9 @@ export interface KPIResumo {
 }
 
 export async function getKpiResumo(filters: {
-  mes_ano?: string
-  contrato?: string
-  sigla?: string
-  ano?: string
+  mes_ano?: string; contrato?: string; sigla?: string; ano?: string
 }): Promise<KPIResumo> {
   let rows = await fetchRaw()
-
   if (filters.mes_ano)  rows = rows.filter(r => clean(r['MES_ANO'])  === filters.mes_ano)
   if (filters.contrato) rows = rows.filter(r => clean(r['CONTRATO']) === filters.contrato)
   if (filters.sigla)    rows = rows.filter(r => clean(r['SIGLA'])    === filters.sigla)
@@ -216,37 +190,28 @@ export async function getKpiResumo(filters: {
   const fechados = rows.filter(r => clean(r['STATUS_CHAMADO'])  === 'FECHADO').length
 
   const rowsFechados = rows.filter(r => clean(r['STATUS_CHAMADO']) === 'FECHADO')
-
   const indispFechados = rowsFechados
     .map(r => num(r['TEMPO_INDISP'], 1000))
     .filter((v): v is number => v !== null)
 
   const totalIndispFechados = indispFechados.reduce((a, b) => a + b, 0)
-  const mttr = rowsFechados.length > 0
-    ? round2(totalIndispFechados / rowsFechados.length)
-    : 0
+  const mttr = rowsFechados.length > 0 ? round2(totalIndispFechados / rowsFechados.length) : 0
 
   const falhasFechadas = rowsFechados.filter(r => clean(r['TIPO_OCORRENCIA']) === 'FALHA').length
   const mtbf = falhasFechadas > 0 ? round2(totalIndispFechados / falhasFechadas) : 0
 
-  // Disponibilidade por equipamento/período
   const eqptoPeriodo = new Map<string, number>()
   for (const r of rowsFechados) {
-    const eqpto = clean(r['EQPTO']) ?? '?'
-    const ma    = clean(r['MES_ANO']) ?? '?'
-    const key   = `${eqpto}|${ma}`
+    const key = `${clean(r['EQPTO']) ?? '?'}|${clean(r['MES_ANO']) ?? '?'}`
     const v = num(r['TEMPO_INDISP'], 1000)
-    if (v !== null) {
-      eqptoPeriodo.set(key, (eqptoPeriodo.get(key) ?? 0) + v)
-    }
+    if (v !== null) eqptoPeriodo.set(key, (eqptoPeriodo.get(key) ?? 0) + v)
   }
 
   const dispVals = Array.from(eqptoPeriodo.values()).map(
     indisp => Math.max(0, ((HH_MES - indisp) / HH_MES) * 100)
   )
   const disp = dispVals.length > 0
-    ? round2(dispVals.reduce((a, b) => a + b, 0) / dispVals.length)
-    : 0
+    ? round2(dispVals.reduce((a, b) => a + b, 0) / dispVals.length) : 0
 
   return {
     total_chamados: total,
@@ -262,21 +227,12 @@ export async function getKpiResumo(filters: {
   }
 }
 
-// ── Evolução Mensal ───────────────────────────────────────────────────────────
+// ── Evolução Mensal ──────────────────────────────────────────────────────────
 
 interface MensalGroup {
-  mes_ano: string
-  mes: number
-  ano: number
-  contrato: string
-  sigla: string
-  total_chamados: number
-  total_falhas: number
-  total_defeitos: number
-  chamados_fechados: number
-  chamados_abertos: number
-  _i: number[]
-  _h: number[]
+  mes_ano: string; mes: number; ano: number; contrato: string; sigla: string
+  total_chamados: number; total_falhas: number; total_defeitos: number
+  chamados_fechados: number; chamados_abertos: number; _i: number[]; _h: number[]
 }
 
 function buildMensalGroup(rows: Row[]): Map<string, MensalGroup> {
@@ -293,8 +249,7 @@ function buildMensalGroup(rows: Row[]): Map<string, MensalGroup> {
         contrato: clean(r['CONTRATO']) ?? '',
         sigla:    clean(r['SIGLA'])    ?? '',
         total_chamados: 0, total_falhas: 0, total_defeitos: 0,
-        chamados_fechados: 0, chamados_abertos: 0,
-        _i: [], _h: [],
+        chamados_fechados: 0, chamados_abertos: 0, _i: [], _h: [],
       })
     }
     const g = grouped.get(key)!
@@ -313,17 +268,15 @@ function buildMensalGroup(rows: Row[]): Map<string, MensalGroup> {
 }
 
 function finalizeGroup(g: MensalGroup) {
-  const ind = g._i
-  const hh  = g._h
-  const totalInd = ind.reduce((a, b) => a + b, 0)
-  const hhMax    = hh.length > 0 ? Math.max(...hh) : 0
+  const totalInd = g._i.reduce((a, b) => a + b, 0)
+  const hhMax    = g._h.length > 0 ? Math.max(...g._h) : 0
   const { _i, _h, ...rest } = g
   void _i; void _h
   return {
     ...rest,
     total_horas_indisp:  round2(totalInd),
     hh_disponivel_mes:   hhMax,
-    mttr_horas:          ind.length > 0 ? round2(totalInd / ind.length) : 0,
+    mttr_horas:          g._i.length > 0 ? round2(totalInd / g._i.length) : 0,
     mtbf_horas:          rest.total_falhas > 0 && hhMax > 0
       ? round2((hhMax - totalInd) / rest.total_falhas) : 0,
     disponibilidade_pct: hhMax > 0
@@ -332,9 +285,7 @@ function finalizeGroup(g: MensalGroup) {
 }
 
 export async function getEvolucaoMensal(filters: {
-  contrato?: string
-  sigla?: string
-  ano?: string
+  contrato?: string; sigla?: string; ano?: string
 }) {
   let rows = await fetchRaw()
   if (filters.contrato) rows = rows.filter(r => clean(r['CONTRATO']) === filters.contrato)
@@ -347,7 +298,7 @@ export async function getEvolucaoMensal(filters: {
     .map(finalizeGroup)
 }
 
-// ── KPIs por Contrato ─────────────────────────────────────────────────────────
+// ── KPIs por Contrato ────────────────────────────────────────────────────────
 
 export async function getKpisPorContrato(filters: { mes_ano?: string; ano?: string }) {
   let rows = await fetchRaw()
@@ -361,13 +312,10 @@ export async function getKpisPorContrato(filters: { mes_ano?: string; ano?: stri
     const key      = `${contrato}|${mesAno}`
     if (!grouped.has(key)) {
       grouped.set(key, {
-        mes_ano: mesAno,
-        contrato,
-        sigla:    clean(r['SIGLA']) ?? '',
-        mes: 0, ano: 0,
+        mes_ano: mesAno, contrato,
+        sigla: clean(r['SIGLA']) ?? '', mes: 0, ano: 0,
         total_chamados: 0, total_falhas: 0, total_defeitos: 0,
-        chamados_fechados: 0, chamados_abertos: 0,
-        _i: [], _h: [],
+        chamados_fechados: 0, chamados_abertos: 0, _i: [], _h: [],
       })
     }
     const g = grouped.get(key)!
@@ -382,16 +330,13 @@ export async function getKpisPorContrato(filters: { mes_ano?: string; ano?: stri
     const h = num(r['HH_DISPONIVEL'])
     if (h !== null) g._h.push(h)
   }
-
   return Array.from(grouped.values()).map(finalizeGroup)
 }
 
-// ── Ocorrências por Sistema ───────────────────────────────────────────────────
+// ── Ocorrências por Sistema ──────────────────────────────────────────────────
 
 export async function getOcorrenciasPorSistema(filters: {
-  mes_ano?: string
-  contrato?: string
-  ano?: string
+  mes_ano?: string; contrato?: string; ano?: string
 }) {
   let rows = await fetchRaw()
   if (filters.mes_ano)  rows = rows.filter(r => clean(r['MES_ANO'])  === filters.mes_ano)
@@ -399,15 +344,15 @@ export async function getOcorrenciasPorSistema(filters: {
   if (filters.ano)      rows = rows.filter(r => clean(r['ANO'])      === filters.ano)
 
   interface SistemaGroup {
-    mes_ano: string; contrato: string; sistema: string; tipo_ocorrencia: string
-    total: number; _i: number[]
+    mes_ano: string; contrato: string; sistema: string
+    tipo_ocorrencia: string; total: number; _i: number[]
   }
   const grouped = new Map<string, SistemaGroup>()
   for (const r of rows) {
-    const sistema = clean(r['SISTEMA']) ?? clean(r['F_SISTEMA']) ?? 'NAO INFORMADO'
-    const tipo    = clean(r['TIPO_OCORRENCIA']) ?? clean(r['F_TIPO_OCORRENCIA']) ?? '?'
-    const mesAno  = clean(r['MES_ANO'])  ?? '?'
-    const contrato = clean(r['CONTRATO']) ?? '?'
+    const sistema  = clean(r['SISTEMA']) ?? clean(r['F_SISTEMA']) ?? 'NAO INFORMADO'
+    const tipo     = clean(r['TIPO_OCORRENCIA']) ?? clean(r['F_TIPO_OCORRENCIA']) ?? '?'
+    const mesAno   = clean(r['MES_ANO'])   ?? '?'
+    const contrato = clean(r['CONTRATO'])  ?? '?'
     const key = `${sistema}|${tipo}|${mesAno}|${contrato}`
     if (!grouped.has(key)) {
       grouped.set(key, { mes_ano: mesAno, contrato, sistema, tipo_ocorrencia: tipo, total: 0, _i: [] })
@@ -426,18 +371,15 @@ export async function getOcorrenciasPorSistema(filters: {
     .sort((a, b) => b.total - a.total)
 }
 
-// ── Ranking Equipamentos ──────────────────────────────────────────────────────
+// ── Ranking Equipamentos ─────────────────────────────────────────────────────
 
-export async function getRankingEquipamentos(filters: {
-  contrato?: string
-  limit?: number
-}) {
+export async function getRankingEquipamentos(filters: { contrato?: string; limit?: number }) {
   let rows = await fetchRaw()
   if (filters.contrato) rows = rows.filter(r => clean(r['CONTRATO']) === filters.contrato)
 
   interface EqptoGroup {
-    eqpto_codigo: string; sigla: string; equipamento: string; contrato: string
-    total_chamados: number; total_falhas: number; _i: number[]
+    eqpto_codigo: string; sigla: string; equipamento: string
+    contrato: string; total_chamados: number; total_falhas: number; _i: number[]
   }
   const grouped = new Map<string, EqptoGroup>()
   for (const r of rows) {
@@ -463,23 +405,18 @@ export async function getRankingEquipamentos(filters: {
     .map(g => {
       const { _i, ...rest } = g
       const total = _i.reduce((a, b) => a + b, 0)
-      return {
-        ...rest,
-        total_horas_indisp: round2(total),
-        mttr_medio: _i.length > 0 ? round2(total / _i.length) : 0,
-      }
+      return { ...rest, total_horas_indisp: round2(total), mttr_medio: _i.length > 0 ? round2(total / _i.length) : 0 }
     })
     .sort((a, b) => b.total_chamados - a.total_chamados)
     .slice(0, limit)
 }
 
-// ── Filtros ───────────────────────────────────────────────────────────────────
+// ── Filtros ──────────────────────────────────────────────────────────────────
 
 export async function getFiltrosOpcoes() {
   const rows = await fetchRaw()
   const set = <T>(fn: (r: Row) => T | null) =>
     Array.from(new Set(rows.map(fn).filter((v): v is T => v !== null))).sort()
-
   return {
     contratos:  set(r => clean(r['CONTRATO'])),
     siglas:     set(r => clean(r['SIGLA'])),
@@ -488,16 +425,11 @@ export async function getFiltrosOpcoes() {
   }
 }
 
-// ── Chamados ──────────────────────────────────────────────────────────────────
+// ── Chamados ─────────────────────────────────────────────────────────────────
 
 export async function getChamados(filters: {
-  mes_ano?: string
-  contrato?: string
-  sigla?: string
-  status?: string
-  ano?: string
-  limit?: number
-  offset?: number
+  mes_ano?: string; contrato?: string; sigla?: string
+  status?: string; ano?: string; limit?: number; offset?: number
 }) {
   let rows = await fetchRaw()
   if (filters.mes_ano)  rows = rows.filter(r => clean(r['MES_ANO'])       === filters.mes_ano)
@@ -511,24 +443,24 @@ export async function getChamados(filters: {
   const offset = filters.offset ?? 0
 
   const data = rows.slice(offset, offset + limit).map(r => ({
-    id_chamado:          clean(r['ID_CHAMADO']),
-    data_inicial:        clean(r['DATA_INICIAL']),
-    equipamento:         clean(r['EQUIPAMENTO']),
-    sigla:               clean(r['SIGLA']),
-    contrato:            clean(r['CONTRATO']),
-    tipo_ocorrencia:     clean(r['TIPO_OCORRENCIA']),
-    descricao_chamado:   clean(r['DESCRICAO']),
-    sistema:             clean(r['SISTEMA']),
-    status_chamado:      clean(r['STATUS_CHAMADO']),
-    tempo_indisp_horas:  num(r['TEMPO_INDISP'], 1000),
-    mes_ano:             clean(r['MES_ANO']),
-    atendentes:          clean(r['ATENDENTES']),
+    id_chamado:         clean(r['ID_CHAMADO']),
+    data_inicial:       clean(r['DATA_INICIAL']),
+    equipamento:        clean(r['EQUIPAMENTO']),
+    sigla:              clean(r['SIGLA']),
+    contrato:           clean(r['CONTRATO']),
+    tipo_ocorrencia:    clean(r['TIPO_OCORRENCIA']),
+    descricao_chamado:  clean(r['DESCRICAO']),
+    sistema:            clean(r['SISTEMA']),
+    status_chamado:     clean(r['STATUS_CHAMADO']),
+    tempo_indisp_horas: num(r['TEMPO_INDISP'], 1000),
+    mes_ano:            clean(r['MES_ANO']),
+    atendentes:         clean(r['ATENDENTES']),
   }))
 
   return { data, total, offset, limit }
 }
 
-// ── Util ──────────────────────────────────────────────────────────────────────
+// ── Util ─────────────────────────────────────────────────────────────────────
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100

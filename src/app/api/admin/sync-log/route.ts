@@ -7,7 +7,7 @@ export async function GET(req: Request) {
 
     // Retorna array vazio (sem histórico de sync)
     // Em uma aplicação real, isso viria de um banco de dados
-    const logs = []
+    const logs: unknown[] = []
 
     return Response.json(logs)
   } catch (e) {

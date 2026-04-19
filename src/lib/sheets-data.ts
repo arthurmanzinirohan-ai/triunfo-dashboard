@@ -24,7 +24,15 @@ export type Row = Record<string, string>
 // ── Normalização de colunas ──────────────────────────────────────────────────
 
 function normKey(k: string): string {
-  return k.trim().replace(/\s+/g, ' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim()
+  return k
+    .trim()
+    .replace(/\s+/g, ' ')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove diacríticos
+    .replace(/º/g, 'O')              // ordinal masculino → O  (ex: Nº → NO)
+    .replace(/ª/g, 'A')              // ordinal feminino → A
+    .toUpperCase()
+    .trim()
 }
 
 const COL_MAP: Record<string, string> = {
@@ -52,10 +60,15 @@ const COL_MAP: Record<string, string> = {
   'SISTEMA':                    'SISTEMA',
   'SERVICO REALIZADO':          'SERVICO',
   'STATUS DO CHAMADO':          'STATUS_CHAMADO',
+  'STATUS':                     'STATUS_CHAMADO',
   'EQUIPAMENTO PARADO?':        'EQ_PARADO',
   'EQUIPAMENTO PARADO':         'EQ_PARADO',
   'TEMPO INDISP.':              'TEMPO_INDISP',
   'TEMPO INDISP':               'TEMPO_INDISP',
+  'DATA FINAL':                 'DATA_FINAL',
+  'HORA FIM':                   'HORA_FIM',
+  'NUMERO CHAMADO AJUSTADO':    'ID_CHAMADO_ALT',
+  'TIPO DEFEITO/FALHA':         'TIPO_OCORRENCIA',
   'HH - SALDO DISPONIVEL MES':  'HH_DISPONIVEL',
   'HH -  SALDO DISPONIVEL MES': 'HH_DISPONIVEL',
   'HH - SALDO DISPONAVEL MES':  'HH_DISPONIVEL',
@@ -129,7 +142,9 @@ export async function fetchRaw(): Promise<Row[]> {
     for (let i = 0; i < canonicalHeaders.length; i++) {
       row[canonicalHeaders[i]] = fields[i] ?? ''
     }
-    if (!clean(row['ID_CHAMADO'])) continue
+    // aceita qualquer coluna de ID disponível
+    if (!clean(row['ID_CHAMADO']) && !clean(row['ID_CHAMADO_ALT'])) continue
+    if (!clean(row['ID_CHAMADO'])) row['ID_CHAMADO'] = row['ID_CHAMADO_ALT'] ?? ''
     result.push(row)
   }
 
